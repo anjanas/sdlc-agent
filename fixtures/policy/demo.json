@@ -1,0 +1,26 @@
+{
+  "revision": "demo-2026.05",
+  "fields": {
+    "summary": { "min": 10, "max": 140 },
+    "acceptanceCriteria": { "minItems": 3, "maxItems": 10 },
+    "description": { "max": 4000 }
+  },
+  "enums": {
+    "productLine": ["IdentityPlatform", "SecurityFoundation"],
+    "requestedStatus": ["Backlog", "ReadyForDev"]
+  },
+  "requiredFields": {
+    "summary": true,
+    "acceptanceCriteria": true,
+    "productLine": true,
+    "requestedStatus": true,
+    "description": false
+  },
+  "prompt": {
+    "hardSections": [
+      "**Governance:** Every generated story MUST include enumerated `productLine` and `requestedStatus` pulled from StoryPolicy enums only.",
+      "**Acceptance criteria:** Emit 3–10 imperative bullets, each independently testable, aligned with QA evidence expectations.",
+      "**Traceability:** Reference PRD headings in `description`; do not invent new ADRs—only cite provided knowledge citations."
+    ]
+  }
+}

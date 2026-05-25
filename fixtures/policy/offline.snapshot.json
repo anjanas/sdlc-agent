@@ -1,0 +1,24 @@
+{
+  "revision": "offline-snapshot-demo",
+  "fields": {
+    "summary": { "min": 10, "max": 140 },
+    "acceptanceCriteria": { "minItems": 3, "maxItems": 10 },
+    "description": { "max": 4000 }
+  },
+  "enums": {
+    "productLine": ["IdentityPlatform", "SecurityFoundation"],
+    "requestedStatus": ["Backlog", "ReadyForDev"]
+  },
+  "requiredFields": {
+    "summary": true,
+    "acceptanceCriteria": true,
+    "productLine": true,
+    "requestedStatus": true,
+    "description": false
+  },
+  "prompt": {
+    "hardSections": [
+      "**Offline mode:** deterministic template only—follow StoryPolicy enums and AC bounds verbatim."
+    ]
+  }
+}

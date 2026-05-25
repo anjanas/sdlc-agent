@@ -1,0 +1,17 @@
+{
+  "projectKey": "DEMO",
+  "issueTypeName": "Story",
+  "defaults": {
+    "reporterEmail": "janedoe@demo.com",
+    "priority": "Medium",
+    "labels": ["reqs-agent-demo", "prd-auth"],
+    "storyPoints": 3,
+    "parentIssueKey": "DEMO-FEATURE"
+  },
+  "customFields": {
+    "productLine": "productLine",
+    "acceptanceCriteria": "acceptanceCriteria",
+    "storyPoints": "storyPoints",
+    "featureParentKey": "featureParentKey"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": "demo-prd",
+  "type": "page",
+  "status": "current",
+  "title": "Building an authentication system",
+  "space": { "key": "DEMO", "name": "Demo Space" },
+  "version": { "number": 3 },
+  "body": {
+    "storage": {
+      "value": "<h1>Building an authentication system</h1><p>PRD outlines login, MFA, password reset flows, and foundational security posture for Account Services.</p><h2>User login</h2><ul><li>Email/password entry with secure session/token lifecycle.</li><li>Brute-force and rate-limit protection on auth endpoints.</li><li>Optional future SSO adapter (out of MVP scope).</li><li><strong>Journey:</strong> Login with valid credentials — session establishes, dashboard landing.</li><li><strong>Journey:</strong> Login with invalid credentials — generic error, no oracle; lockout thresholds documented.</li><li><strong>Journey:</strong> Login with MFA — challenge follows primary authentication; cancel/back preserves no partial privileged session.</li></ul><h2>Multi-factor authentication</h2><ul><li>MFA enrollment and removal UX.</li><li>TOTP-first with WebAuthn follow-on in roadmap framing.</li><li>Backup codes policy and audit trails for MFA events.</li></ul><h2>Password reset</h2><ul><li>Timeboxed single-use reset tokens emailed to verified channel.</li><li>Interactions with MFA and lockouts; safe user-facing wording.</li><li>Observe password policy on reset completion.</li></ul><h2>Security constraints</h2><ul><li>Hashed credential storage aligning with accepted ADR baseline.</li><li>HTTPS-only transport with HSTS for web clients.</li><li>Secrets via managed vault—not configuration files.</li><li>C4-aligned architecture: Auth Gateway ↔ Session Service ↔ Identity store.</li></ul>",
+      "representation": "storage"
+    }
+  },
+  "_links": {
+    "self": "http://mock.local/wiki/rest/api/content/demo-prd"
+  }
+}

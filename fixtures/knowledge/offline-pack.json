@@ -1,0 +1,16 @@
+[
+  {
+    "id": "offline-chunk-static",
+    "doc_type": "story_template",
+    "score": 1.0,
+    "excerpt": "Offline story template preamble: cite PRD breadcrumbs and align with Identity governance.",
+    "citations": [{"source_id": "tpl-story-skeleton", "heading": "template-preamble"}]
+  },
+  {
+    "id": "offline-adr-argon2",
+    "doc_type": "adr",
+    "score": 0.95,
+    "excerpt": "ADR excerpt: Argon2id baseline for verifier latency budgets.",
+    "citations": [{"source_id": "adr-042-password-hashing", "heading": "adr-042"}]
+  }
+]
