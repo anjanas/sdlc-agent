@@ -6,7 +6,7 @@
     "description": { "max": 4000 }
   },
   "enums": {
-    "productLine": ["IdentityPlatform", "SecurityFoundation"],
+    "productLine": ["WealthManagement", "AdvisoryServices"],
     "requestedStatus": ["Backlog", "ReadyForDev"]
   },
   "requiredFields": {

@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
+
 from reqs_agent_demo.agent.graph import GraphDeps, compile_demo_graph, initialise_state
 from reqs_agent_demo.connectors.factories import create_demo_clients
 from reqs_agent_demo.paths import config_path, fixtures_path
@@ -84,6 +86,7 @@ def run_generation_invoke(
     mock_origin: str,
     max_repairs: int,
     model: str,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> tuple[dict[str, Any], GraphDeps, Any, Any]:
     """First invoke (+ graph + runnable_config for resume Command)."""
 
@@ -94,7 +97,7 @@ def run_generation_invoke(
         max_repairs=max_repairs,
         model=model,
     )
-    runner_graph = compile_demo_graph(deps)
+    runner_graph = compile_demo_graph(deps, checkpointer=checkpointer)
 
     initial_board = initialise_state(
         page_id=page_id,

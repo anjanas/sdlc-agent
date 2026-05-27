@@ -1088,7 +1088,7 @@ wheels = [
 ]
 
 [[package]]
-name = "reqs-agent-demo"
+name = "reqs-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

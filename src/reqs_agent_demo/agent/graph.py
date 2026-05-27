@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -301,12 +302,31 @@ def _human_gate(state: AgentState) -> dict[str, Any]:
     resume = interrupt(pause)
 
     approve = False
+    story_descriptions: list[str] | None = None
+
     if isinstance(resume, dict):
         approve = bool(resume.get("approve"))
+        raw = resume.get("story_descriptions")
+        if isinstance(raw, list):
+            story_descriptions = ["" if x is None else str(x) for x in raw]
     elif isinstance(resume, bool):
         approve = resume
 
-    return {"approval_granted": approve}
+    out: dict[str, Any] = {"approval_granted": approve}
+
+    if approve and story_descriptions is not None:
+        stories_in = state.get("validated_stories") or []
+        if stories_in:
+            merged: list[dict[str, Any]] = []
+            for i, st in enumerate(stories_in):
+                row = dict(st) if isinstance(st, dict) else {}
+                if i < len(story_descriptions):
+                    trimmed = story_descriptions[i].strip()
+                    row["description"] = trimmed if trimmed else None
+                merged.append(row)
+            out["validated_stories"] = merged
+
+    return out
 
 
 def _fail_hard(state: AgentState) -> dict[str, Any]:
@@ -366,8 +386,8 @@ def _reject_finalize(state: AgentState) -> dict[str, Any]:
     return {"transcript_path": str(tpath), "jira_projection": {"issues": [], "approval_granted": False}}
 
 
-def compile_demo_graph(deps: GraphDeps):
-    saver = MemorySaver()
+def compile_demo_graph(deps: GraphDeps, *, checkpointer: BaseCheckpointSaver | None = None):
+    saver = checkpointer if checkpointer is not None else MemorySaver()
     sg = StateGraph(AgentState)
 
     sg.add_node("fetch_story_policy", lambda s: _fetch_policy(s, deps))

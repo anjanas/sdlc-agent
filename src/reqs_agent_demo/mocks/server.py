@@ -12,15 +12,24 @@ import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import frontmatter as pyfm
 import uvicorn
 from fastapi import FastAPI, Form, Header, HTTPException, Query, Request
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
-from reqs_agent_demo.paths import project_root
-from reqs_agent_demo.pipeline_runner import close_graph_clients, run_generation_invoke
+from reqs_agent_demo.agent.graph import compile_demo_graph
+from reqs_agent_demo.connectors.jira import ApprovedBacklog, ApprovedStory, build_jira_issue_posts
+from reqs_agent_demo.paths import config_path, project_root
+from reqs_agent_demo.pipeline_runner import (
+    build_graph_deps_for_run,
+    close_graph_clients,
+    run_generation_invoke,
+)
 
 _REPO_ROOT = project_root()
 
@@ -70,6 +79,11 @@ _CORPUS, _IDF = _build_corpus(_REPO_ROOT)
 _ISSUES = []
 _ISSUE_COUNTER = 1
 
+# Shared across HTTP requests so LangGraph `interrupt` / `Command(resume=…)` can resume a run.
+_DEMO_GRAPH_CHECKPOINTER = MemorySaver()
+# Populated when generation pauses at the human gate; keyed by `run_id` / LangGraph `thread_id`.
+_JIRA_APPROVAL_PREVIEW: dict[str, list[dict[str, Any]]] = {}
+
 
 def reset_store() -> None:
     """Reset in-memory demo Jira backlog (mostly for tests/manual replay)."""
@@ -77,6 +91,7 @@ def reset_store() -> None:
     global _ISSUE_COUNTER  # pylint: disable=global-statements
     _ISSUES.clear()
     _ISSUE_COUNTER = 1
+    _JIRA_APPROVAL_PREVIEW.clear()
 
 
 def _score(query: str) -> list[tuple[float, dict[str, Any]]]:
@@ -165,7 +180,11 @@ def _format_story_points_display(fields: dict[str, Any]) -> str:
 
 def _format_feature_parent_display(fields: dict[str, Any]) -> str:
     link = fields.get("featureParentKey")
-    return str(link) if link not in (None, "") else ""
+    if link is None or link == "":
+        return ""
+    if isinstance(link, dict):
+        return str(link.get("key") or link.get("issueKey") or json.dumps(link))
+    return str(link)
 
 
 def _render_jira_issue_page(api: dict[str, Any], stored: dict[str, Any], request: Request) -> str:
@@ -185,7 +204,11 @@ def _render_jira_issue_page(api: dict[str, Any], stored: dict[str, Any], request
     desc_raw = fields.get("description")
     if desc_raw is None:
         desc_raw = ""
-    description_html = html.escape(str(desc_raw)).replace("\n", "<br />\n")
+    desc_plain = str(desc_raw)
+    desc_textarea_body = html.escape(desc_plain)
+
+    issue_key_raw = str(api.get("key") or "")
+    desc_save_action = html.escape(f"/demo/jira-issue/{issue_key_raw}/description")
 
     detail_rows: list[str] = []
     skip_known = frozenset(
@@ -227,6 +250,24 @@ def _render_jira_issue_page(api: dict[str, Any], stored: dict[str, Any], request
 
     json_href = f"{request.url.path}?format=json"
     all_href = "/demo/issues"
+
+    description_locked = bool(stored.get("_demo_description_locked"))
+    description_readonly_inner = html.escape(desc_plain).replace("\n", "<br />\n")
+
+    if description_locked:
+        desc_section = f"""          <div class="section-title">Description</div>
+          <p class="desc-hint"><strong>Saved.</strong> This description cannot be edited in this mock viewer anymore.</p>
+          <div class="description">{description_readonly_inner or "<em>No description</em>"}</div>
+"""
+    else:
+        desc_section = f"""          <div class="section-title">Description <span style="font-weight:400;color:var(--text-subtle);text-transform:none;font-size:12px">(editable mock)</span></div>
+          <p class="desc-hint">Edit below, then click <strong>Update</strong>. After save the description locks and this button disappears.</p>
+          <form method="post" action="{desc_save_action}" class="desc-form">
+            <textarea name="description" class="description-edit" rows="10"
+              spellcheck="true" placeholder="Plain-text issue description">{desc_textarea_body}</textarea>
+            <button type="submit" class="save-desc">Update</button>
+          </form>
+"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -360,6 +401,42 @@ def _render_jira_issue_page(api: dict[str, Any], stored: dict[str, Any], request
       border: 1px solid var(--border);
       min-height: 48px;
     }}
+    .desc-form {{
+      margin-top: 8px;
+    }}
+    .description-edit {{
+      display: block;
+      width: 100%;
+      min-height: 140px;
+      margin: 0 0 10px;
+      padding: 12px 14px;
+      font: inherit;
+      line-height: 1.45;
+      color: var(--text);
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      resize: vertical;
+      box-sizing: border-box;
+    }}
+    .desc-form .save-desc {{
+      background: var(--jira-blue);
+      color: #fff;
+      border: none;
+      border-radius: 3px;
+      padding: 8px 14px;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 13px;
+    }}
+    .desc-form .save-desc:hover {{
+      background: var(--jira-blue-hover);
+    }}
+    .desc-hint {{
+      font-size: 12px;
+      color: var(--text-subtle);
+      margin: 0 0 8px;
+    }}
     .detail-table {{
       width: 100%;
       border-collapse: collapse;
@@ -409,9 +486,7 @@ def _render_jira_issue_page(api: dict[str, Any], stored: dict[str, Any], request
       </div>
       <div class="issue-body">
         <div class="main">
-          <div class="section-title">Description</div>
-          <div class="description">{description_html or "<em>No description</em>"}</div>
-          {f'<div class="section-title">Fields</div><table class="detail-table">{extra_fields}</table>' if extra_fields else ""}
+{desc_section}{f'<div class="section-title">Fields</div><table class="detail-table">{extra_fields}</table>' if extra_fields else ""}
           <div class="footer-links">
             <a href="{html.escape(json_href)}">View as JSON</a>
             &nbsp;·&nbsp;
@@ -656,12 +731,13 @@ def _render_confluence_hub_page(data: dict[str, Any]) -> str:
           <button type="submit">Generate Jira stories</button>
           <label>
             <input type="checkbox" name="use_openai" value="yes" />
-            Use hosted OpenAI (needs a valid OPENAI_API_KEY in the mock-dev shell)
+            Use hosted OpenAI (needs a valid OPENAI_API_KEY in the requirements-generation-agent shell)
           </label>
           <span class="hint">
             Defaults to deterministic heuristic stories (no billing). Mirrors
-            <code style="background:#eaeff5;padding:1px 4px;border-radius:2px;">uv run demo pipeline --fixture-mode --ci --offline</code>
-            unless you tick OpenAI above. Runs are auto-approved for this demo hub only.
+            <code style="background:#eaeff5;padding:1px 4px;border-radius:2px;">uv run demo pipeline --fixture-mode --offline</code>
+            unless you tick OpenAI above. You must confirm draft stories — the hub shows mocked Jira field payloads
+            (summary, status, reporter, priorities, acceptance criteria, and more) before anything is POSTed.
           </span>
         </form>
       </div>
@@ -684,8 +760,19 @@ def _render_demo_issues_page(request: Request, *, banner: str | None = None) -> 
     banner_html = ""
     if banner == "generated":
         banner_html = (
-            '<div class="banner ok">Stories were generated via the mocked Confluence action bar — '
+            '<div class="banner ok">Stories were approved and created in the mock Jira backlog — '
             "open keys below as Jira-styled HTML.</div>"
+        )
+    elif banner == "rejected":
+        banner_html = (
+            '<div class="banner warn">You cancelled approval — '
+            "<strong>no</strong> mock Jira stories were created. Generate again anytime from the PRD page.</div>"
+        )
+    elif banner == "validation_failed":
+        banner_html = (
+            '<div class="banner bad">Story validation exhausted allowed repairs — '
+            "check <code>runs/&lt;run&gt;/transcript.failure.json</code> in the checkout (requirements-generation-agent stderr for details)."
+            "</div>"
         )
 
     rows: list[str] = []
@@ -715,10 +802,234 @@ a:hover {{ text-decoration:underline; }}
 .banner {{ margin:14px auto 0; max-width:900px; padding:10px 14px; border-radius:3px;
   font-size:13px; font-weight:600; }}
 .banner.ok {{ background:#e3fcef; color:#064; border:1px solid #abf5d1; }}
-</style></head><body><div class="top">Demo Jira backlog (in-memory mock)</div>
+.banner.warn {{ background:#fffae6; color:#974f00; border:1px solid #ffe58f; }}
+.banner.bad {{ background:#ffebe6; color:#5d1f1f; border:1px solid #ffbdad; }}
+</style></head><body><div class="top">Demo Jira backlog </div>
 {banner_html}
 <div class="shell"><table><thead><tr><th>Key</th><th>Summary</th></tr></thead><tbody>{tbody}</tbody></table>
 <div class="links"><a href="{origin}/">&larr; Back to mocked Confluence PRD</a> · JSON: <code>/demo/issues?format=json</code></div></div></body></html>"""
+
+
+def _hub_jira_field_map() -> dict[str, Any]:
+    return json.loads(config_path("jira-field-map.json").read_text())
+
+
+def _hub_issue_preview_posts(outcome_bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    """POST bodies identical to `/rest/api/3/issue`, for reviewer preview."""
+    rid = str(outcome_bundle.get("run_id") or "pending")
+    stories_raw = outcome_bundle.get("validated_stories") or []
+    backlog = ApprovedBacklog(run_id=rid, stories=[ApprovedStory.model_validate(s) for s in stories_raw])
+    return build_jira_issue_posts(backlog, _hub_jira_field_map())
+
+
+def _cf(fields: dict[str, Any], field_map: dict[str, Any], key: str) -> Any | None:
+    cf = field_map.get("customFields") or {}
+    id_key = cf.get(key)
+    if not isinstance(id_key, str) or not id_key.strip():
+        return None
+    return fields.get(id_key)
+
+
+def _render_jira_story_approval_page(request: Request, *, run_id: str, posts: list[dict[str, Any]]) -> str:
+    origin = html.escape(str(request.base_url).rstrip("/"))
+    fm = _hub_jira_field_map()
+
+    rows: list[str] = []
+    for idx, post in enumerate(posts):
+        display_num = idx + 1
+        fields_lo = dict(post.get("fields") or {})
+        status_txt = html.escape(str(post.get("_demo_requestedStatus") or ""))
+        summary = html.escape(str(fields_lo.get("summary") or "(no summary)"))
+
+        proj = fields_lo.get("project") or {}
+        pkey = proj.get("key") if isinstance(proj, dict) else ""
+        pkey_esc = html.escape(str(pkey or ""))
+
+        it = fields_lo.get("issuetype") or {}
+        it_name = it.get("name") if isinstance(it, dict) else it
+        it_esc = html.escape(str(it_name or "Story"))
+
+        ac_raw = _cf(fields_lo, fm, "acceptanceCriteria")
+        ac_esc = ""
+        if ac_raw is not None:
+            body = html.escape(str(ac_raw))
+            ac_esc = f'<pre style="margin:10px 0 0;background:#f4f5f7;padding:10px;border-radius:3px;white-space:pre-wrap">{body}</pre>'
+
+        pl_raw = _cf(fields_lo, fm, "productLine")
+        pl_esc = html.escape(str(pl_raw) if pl_raw is not None else "")
+
+        sp_raw = _cf(fields_lo, fm, "storyPoints")
+        pts_esc = html.escape("" if sp_raw is None else str(sp_raw))
+
+        pri_esc = html.escape(_format_priority_display(fields_lo))
+        rep_esc = html.escape(_format_reporter_display(fields_lo))
+        lab_esc = html.escape(_format_labels_display(fields_lo))
+        par_esc = html.escape(_format_parent_display(fields_lo))
+
+        desc_raw = fields_lo.get("description")
+        if desc_raw is None:
+            desc_raw = ""
+        desc_for_ta = html.escape(str(desc_raw))
+
+        dl = "".join(
+            [
+                "<dl>",
+                f'<div class="kv"><dt>Story</dt><dd><strong>#{display_num}</strong></dd></div>',
+                '<div class="kv"><dt>Summary</dt><dd><strong>', summary, "</strong></dd></div>",
+                f'<div class="kv"><dt>Project key</dt><dd>{pkey_esc}</dd></div>',
+                f'<div class="kv"><dt>Issue type</dt><dd>{it_esc}</dd></div>',
+                f'<div class="kv"><dt>Workflow status </dt><dd>{status_txt}</dd></div>',
+                f'<div class="kv"><dt>Priority</dt><dd>{pri_esc}</dd></div>',
+                f'<div class="kv"><dt>Reporter</dt><dd>{rep_esc}</dd></div>',
+                f'<div class="kv"><dt>Labels</dt><dd>{lab_esc}</dd></div>',
+                f'<div class="kv"><dt>Story points</dt><dd>{pts_esc}</dd></div>',
+                f'<div class="kv"><dt>Parent</dt><dd>{par_esc}</dd></div>',
+                f'<div class="kv"><dt>Product line</dt><dd>{pl_esc}</dd></div>',
+                '<div class="kv"><dt>Acceptance criteria</dt><dd>',
+                ac_esc or "<em>(none)</em>",
+                "</dd></div>",
+                '<div class="kv"><dt>Description (editable)</dt><dd>',
+                '<label for="desc_',
+                str(idx),
+                '" class="sr-only">Edit description for story ',
+                str(display_num),
+                "</label>",
+                (
+                    f'<textarea id="desc_{idx}" name="story_description_{idx}" rows="8" '
+                    f'spellcheck="true" placeholder="Plain-text description (saved when you approve)" '
+                    f'class="desc">{desc_for_ta}</textarea>'
+                ),
+                '<p class="field-hint">Merged into validated stories before <code>POST /rest/api/3/issue</code>.</p>',
+                "</dd></div>",
+                "</dl>",
+            ]
+        )
+        rows.append(f'<section class="card"><h2>Story {display_num}</h2>{dl}</section>')
+
+    cards = "".join(rows) if rows else '<p class="empty"><em>No preview payload — validate run_id and try generating again.</em></p>'
+    run_esc = html.escape(run_id)
+    story_count = len(posts)
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width"/>
+<title>Approve Jira stories (mock)</title>
+<style>
+body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  background:#f4f5f7; color:#172b4d; }}
+.hdr {{ background:#0052cc; color:#fff; padding:14px 20px; font-weight:600; }}
+.wrap {{ max-width:920px; margin:16px auto 40px; padding:0 16px; }}
+.runid {{ font-size:13px; color:#5e6c84; margin:8px 0 16px; }}
+.card {{ background:#fff; border:1px solid #dfe1e6; border-radius:3px; padding:14px 16px;
+  margin-bottom:16px; box-shadow:0 1px 1px rgba(9,30,66,.06); }}
+.card h2 {{ margin:0 0 12px; font-size:15px; color:#0747a6; }}
+.kv {{ margin:8px 0; }}
+dl {{ margin:0; }}
+dt {{ font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:#5e6c84; }}
+dd {{ margin:2px 0 0 0; font-size:14px; }}
+.desc {{ width:100%; box-sizing:border-box; font-size:14px; padding:10px 12px; margin-top:6px;
+  min-height:100px; border:2px solid #0052cc; border-radius:3px; resize:vertical; font-family:inherit;
+  line-height:1.45; background:#fff; }}
+.field-hint {{ margin:6px 0 0; font-size:12px; color:#5e6c84; }}
+.sr-only {{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
+  clip:rect(0,0,0,0); white-space:nowrap; border:0; }}
+.actions {{ margin-top:22px; display:flex; gap:12px; flex-wrap:wrap; align-items:center; }}
+.note {{ margin-top:10px; font-size:13px; color:#5e6c84; }}
+button {{ cursor:pointer; font:inherit; }}
+.btn-submit {{ border:none; background:#0052cc; color:#fff; border-radius:3px;
+  padding:10px 16px; font-weight:600; }}
+.btn-cancel {{ border:1px solid #dfe1e6; background:#fff; border-radius:3px; padding:10px 16px; }}
+a.back {{ font-size:14px; color:#0052cc; text-decoration:none; }}
+.empty {{ padding:14px 0; }}
+</style></head><body><div class="hdr">Approve mock Jira stories</div>
+<div class="wrap">
+  <div class="runid">Run Id: <code>{run_esc}</code></div>
+  <form method="post" action="/demo/jira-approval/decision">
+    <input type="hidden" name="run_id" value="{run_esc}" />
+    <input type="hidden" name="story_count" value="{story_count}" />
+    <p>Review the fields below. You can edit each <strong>description</strong> before the mock
+    <code>POST /rest/api/3/issue</code> runs. Approve to create issues, or cancel.</p>
+    {cards}
+    <div class="actions">
+      <button type="submit" name="decision" value="approve" class="btn-submit">Create stories in mock Jira</button>
+      <button type="submit" name="decision" value="reject" class="btn-cancel">Cancel — do not create</button>
+      <span class="note"><a class="back" href="{origin}/">&larr; Back to PRD</a></span>
+    </div>
+  </form>
+</div>
+</body></html>"""
+
+
+def _generation_job(origin: str, use_openai: bool) -> dict[str, Any]:
+    """LangGraph fixture run; pauses at human gate (`auto_approve=False`) until HTTP resume."""
+
+    model_local = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    api_key_present = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    if use_openai and not api_key_present:
+        raise ValueError(
+            "OpenAI checkbox is checked but OPENAI_API_KEY is empty — "
+            "export a key or leave the box unchecked for offline heuristic stories."
+        )
+    offline_llm = not use_openai
+
+    outcome_bundle, deps_box, _, _ = run_generation_invoke(
+        page_id="demo-prd",
+        offline_llm=offline_llm,
+        approve_path_txt=None,
+        auto_approve=False,
+        fixture_mode=True,
+        mock_origin=origin.rstrip("/"),
+        max_repairs=3,
+        model=model_local,
+        checkpointer=_DEMO_GRAPH_CHECKPOINTER,
+    )
+
+    paused = outcome_bundle.get("__interrupt__") or []
+
+    if paused:
+        rid = str(outcome_bundle.get("run_id") or "").strip()
+        if not rid:
+            raise RuntimeError("approval interrupt missing run_id")
+        preview_posts = _hub_issue_preview_posts(outcome_bundle)
+        _JIRA_APPROVAL_PREVIEW[rid] = preview_posts
+        return {"status": "need_approval", "run_id": rid}
+
+    close_graph_clients(deps_box)
+
+    proj_err = str((outcome_bundle.get("jira_projection") or {}).get("error") or "")
+    if proj_err == "validation_exhausted":
+        return {"status": "validation_failed", "outcome_bundle": outcome_bundle}
+
+    _log.warning(
+        "generation finished without human-gate pause; keys=%s",
+        sorted(outcome_bundle.keys()),
+    )
+    return {"status": "unexpected_complete", "outcome_bundle": outcome_bundle}
+
+
+def _resume_story_approval_job(
+    origin: str, run_id: str, approve: bool, story_descriptions: list[str] | None = None
+) -> dict[str, Any]:
+    model_local = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    deps_box = build_graph_deps_for_run(
+        page_id="demo-prd",
+        fixture_mode=True,
+        mock_origin=origin.rstrip("/"),
+        max_repairs=3,
+        model=model_local,
+    )
+    runner_graph = compile_demo_graph(deps_box, checkpointer=_DEMO_GRAPH_CHECKPOINTER)
+    cfg = {"configurable": {"thread_id": run_id}}
+    resume_payload: dict[str, Any] = {"approve": approve}
+    if approve and story_descriptions is not None:
+        resume_payload["story_descriptions"] = story_descriptions
+
+    try:
+        outcome_bundle: dict[str, Any] = runner_graph.invoke(Command(resume=resume_payload), cfg)
+        return outcome_bundle
+    finally:
+        close_graph_clients(deps_box)
+        _JIRA_APPROVAL_PREVIEW.pop(run_id, None)
 
 
 app = FastAPI(title="Reqs Agent Demo Unified Mocks", version="0.1")
@@ -735,44 +1046,14 @@ def confluence_hub() -> HTMLResponse:
     return HTMLResponse(_render_confluence_hub_page(payload))
 
 
-def _generation_job(origin: str, use_openai: bool) -> dict[str, Any]:
-    """Blocking LangGraph fixture run (fixture_mode + auto-approve)."""
-
-    model_local = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    deps_box: Any = None
-
-    api_key_present = bool(os.getenv("OPENAI_API_KEY", "").strip())
-    if use_openai and not api_key_present:
-        raise ValueError(
-            "OpenAI checkbox is checked but OPENAI_API_KEY is empty — "
-            "export a key or leave the box unchecked for offline heuristic stories."
-        )
-    offline_llm = not use_openai
-
-    try:
-        outcome_bundle, deps_box, _, _ = run_generation_invoke(
-            page_id="demo-prd",
-            offline_llm=offline_llm,
-            approve_path_txt=None,
-            auto_approve=True,
-            fixture_mode=True,
-            mock_origin=origin.rstrip("/"),
-            max_repairs=3,
-            model=model_local,
-        )
-        return outcome_bundle
-    finally:
-        if deps_box is not None:
-            close_graph_clients(deps_box)
-
-
 @app.post("/demo/generate-jira-stories")
 async def generate_jira_from_hub(request: Request, use_openai: str | None = Form(default=None)):
     openai_requested = use_openai == "yes"
     wants_html_nav = _client_wants_html(request)
+    base = str(request.base_url).rstrip("/")
 
     try:
-        await run_in_threadpool(_generation_job, str(request.base_url), openai_requested)
+        result = await run_in_threadpool(_generation_job, str(request.base_url), openai_requested)
     except ValueError as bad:
         _log.warning("%s", bad)
         raise HTTPException(status_code=400, detail=str(bad)) from bad
@@ -781,20 +1062,156 @@ async def generate_jira_from_hub(request: Request, use_openai: str | None = Form
         raise HTTPException(
             status_code=500,
             detail=(
-                "Generate failed — see mock-dev stderr for traceback. Typical causes: bogus OPENAI_API_KEY "
+                "Generate failed — see requirements-generation-agent stderr for traceback. Typical causes: bogus OPENAI_API_KEY "
                 "with OpenAI toggled on, mocks not on 8877, or run graph errors. "
                 f"Underlying: {exc!s}"
             ),
         ) from exc
 
+    if result["status"] == "need_approval":
+        rid = str(result["run_id"])
+        if wants_html_nav:
+            return RedirectResponse(url=f"/demo/jira-approval?run_id={quote(rid)}", status_code=303)
+
+        approve_url = f"{base}/demo/jira-approval?run_id={quote(rid)}"
+        return {
+            "ok": True,
+            "awaiting_approval": True,
+            "run_id": rid,
+            "approve_review_page_html": approve_url,
+            "decision_endpoint": f"{base}/demo/jira-approval/decision",
+        }
+
+    if result["status"] == "validation_failed":
+        if wants_html_nav:
+            return RedirectResponse(url="/demo/issues?banner=validation_failed", status_code=303)
+        return {
+            "ok": False,
+            "error": "validation_exhausted",
+            "jira_projection": (result["outcome_bundle"].get("jira_projection")),
+        }
+
+    _log.error("hub generation completed without hitting human gate pause (%r)", result.get("status"))
+
     if wants_html_nav:
-        return RedirectResponse(url="/demo/issues?banner=generated", status_code=303)
+        return RedirectResponse(url="/demo/issues?banner=validation_failed", status_code=303)
+
+    return {
+        "ok": False,
+        "error": "unexpected_generation_outcome",
+        "detail": {"status": result.get("status")},
+    }
+
+
+@app.get("/demo/jira-approval")
+def demo_jira_story_approval(
+    request: Request,
+    run_id: str = Query(description="Returned from `/demo/generate-jira-stories` interrupt."),
+) -> HTMLResponse:
+    rid = (run_id or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="run_id query parameter required")
+
+    model_local = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    origin = str(request.base_url).rstrip("/")
+
+    entries = list(_JIRA_APPROVAL_PREVIEW.get(rid, []))
+    if not entries:
+        deps_box = build_graph_deps_for_run(
+            page_id="demo-prd",
+            fixture_mode=True,
+            mock_origin=origin,
+            max_repairs=3,
+            model=model_local,
+        )
+        runner_graph = compile_demo_graph(deps_box, checkpointer=_DEMO_GRAPH_CHECKPOINTER)
+        cfg = {"configurable": {"thread_id": rid}}
+        try:
+            snap = runner_graph.get_state(cfg)
+        finally:
+            close_graph_clients(deps_box)
+
+        vals = getattr(snap, "values", None)
+        if isinstance(vals, dict):
+            rebound = {**vals, "run_id": rid}
+            entries = _hub_issue_preview_posts(rebound)
+            if entries:
+                _JIRA_APPROVAL_PREVIEW[rid] = entries
+
+        if not entries:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No pending approval session for that run Id — submit "
+                    "**Generate Jira stories** again from `/`."
+                ),
+            )
+
+    return HTMLResponse(_render_jira_story_approval_page(request, run_id=rid, posts=entries))
+
+
+@app.post("/demo/jira-approval/decision")
+async def demo_jira_story_approval_decision(request: Request):
+    form = await request.form()
+
+    def _mp_str(field: str) -> str:
+        raw = form.get(field)
+        return raw.strip() if isinstance(raw, str) else ""
+
+    def _mp_positive_int(field: str) -> int:
+        raw = form.get(field)
+        if not isinstance(raw, str):
+            return 0
+        try:
+            return max(0, int(raw.strip() or "0"))
+        except ValueError:
+            return 0
+
+    rid = _mp_str("run_id")
+    decision = _mp_str("decision")
+    approve = decision.lower() == "approve"
+    wants_html = _client_wants_html(request)
+
+    story_descriptions: list[str] | None = None
+    if approve:
+        n = _mp_positive_int("story_count")
+        story_descriptions = [_mp_str(f"story_description_{i}") for i in range(n)]
+
+    if not rid:
+        raise HTTPException(status_code=400, detail="run_id required")
+
+    try:
+        outcome_bundle = await run_in_threadpool(
+            _resume_story_approval_job, str(request.base_url), rid, approve, story_descriptions
+        )
+    except Exception as exc:
+        _log.exception("Resume approval failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    projection = outcome_bundle.get("jira_projection") or {}
+    issued = projection.get("jira_issues")
+
+    issued_keys = [
+        str(item["key"]) for item in (issued if isinstance(issued, list) else []) if isinstance(item, dict)
+    ]
 
     base = str(request.base_url).rstrip("/")
+
+    if wants_html:
+        if approve and issued_keys:
+            return RedirectResponse(url="/demo/issues?banner=generated", status_code=303)
+        if not approve:
+            return RedirectResponse(url="/demo/issues?banner=rejected", status_code=303)
+        return RedirectResponse(url="/demo/issues?banner=validation_failed", status_code=303)
+
+    ok = approve and len(issued_keys) > 0
     return {
-        "ok": True,
+        "ok": ok,
+        "approved": approve,
+        "issue_keys_created": issued_keys,
         "demo_issues_html": base + "/demo/issues",
         "demo_issues_json": base + "/demo/issues?format=json",
+        "projection": projection,
     }
 
 
@@ -837,6 +1254,41 @@ async def retrieve(body: dict[str, Any]):
             }
         )
     return {"chunks": chunks, "query": query}
+
+
+@app.post("/demo/jira-issue/{issue_key}/description")
+async def demo_update_mock_issue_description(issue_key: str, request: Request):
+    """Persist edited description into the in-memory mock issue store (browser HTML UX)."""
+
+    form = await request.form()
+    raw = form.get("description")
+    body = raw if isinstance(raw, str) else ""
+
+    found = False
+    for stored in _ISSUES:
+        if stored.get("key") == issue_key or str(stored.get("id") or "") == issue_key:
+            found = True
+            fe = dict(stored.get("fields_echo") or {})
+            trimmed = body.strip()
+            fe["description"] = trimmed if trimmed else None
+            stored["fields_echo"] = fe
+            accepted = stored.get("accepted_body")
+            if isinstance(accepted, dict):
+                accepted_fields = dict(accepted.get("fields") or {})
+                accepted_fields["description"] = fe["description"]
+                accepted["fields"] = accepted_fields
+                stored["accepted_body"] = accepted
+            stored["_demo_description_locked"] = True
+            break
+
+    if not found:
+        raise HTTPException(status_code=404, detail="issue not found in mock store")
+
+    loc = quote(issue_key, safe="")
+    return RedirectResponse(
+        url=f"/rest/api/3/issue/{loc}?format=html",
+        status_code=303,
+    )
 
 
 @app.get("/wiki/rest/api/content/{content_id}")

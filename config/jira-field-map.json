@@ -1,12 +1,12 @@
 {
-  "projectKey": "DEMO",
+  "projectKey": "User-Auth",
   "issueTypeName": "Story",
   "defaults": {
     "reporterEmail": "janedoe@demo.com",
     "priority": "Medium",
-    "labels": ["reqs-agent-demo", "prd-auth"],
+    "labels": ["reqs-agent", "prd-auth"],
     "storyPoints": 3,
-    "parentIssueKey": "DEMO-FEATURE"
+    "parentIssueKey": "Jira-100"
   },
   "customFields": {
     "productLine": "productLine",

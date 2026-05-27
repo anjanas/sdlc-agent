@@ -43,6 +43,90 @@ class ApprovedBacklog(BaseModel):
     stories: list[ApprovedStory]
 
 
+def build_jira_issue_posts(backlog: ApprovedBacklog, field_map: dict[str, Any]) -> list[dict[str, Any]]:
+    """API-ready POST bodies aligned with `/rest/api/3/issue` (shared by preview + `JiraConnector.create_stories`)."""
+
+    custom_fields_map = dict(field_map.get("customFields", {}))
+    defaults = dict(field_map.get("defaults") or {})
+    proj = field_map["projectKey"]
+    issue_type = field_map["issueTypeName"]
+
+    ac_field = custom_fields_map.get("acceptanceCriteria") or ""
+    prod_field = custom_fields_map.get("productLine") or ""
+    sp_field = custom_fields_map.get("storyPoints") or ""
+    feature_parent_cf = custom_fields_map.get("featureParentKey") or custom_fields_map.get("epicLink") or ""
+
+    reporter_default = defaults.get("reporterEmail") or "janedoe@demo.com"
+    priority_default = defaults.get("priority") or "Medium"
+    labels_default = [str(l) for l in (defaults.get("labels") or []) if str(l)]
+    points_default_raw = defaults.get("storyPoints", 3)
+    try:
+        points_default_f: int | float = float(points_default_raw)
+        if points_default_f == int(points_default_f):
+            points_default_f = int(points_default_f)
+    except (TypeError, ValueError):
+        points_default_f = 3
+    parent_default = defaults.get("parentIssueKey")
+
+    def _merged_labels(extra: list[str] | None) -> list[str]:
+        seen: dict[str, None] = {}
+        merged: list[str] = []
+        for lab in [*labels_default, *(extra or [])]:
+            lowered = lab.strip()
+            if not lowered or lowered.casefold() in seen:
+                continue
+            seen[lowered.casefold()] = None
+            merged.append(lab.strip())
+        return merged
+
+    posts: list[dict[str, Any]] = []
+
+    for story in backlog.stories:
+        plain_ac = "\n".join(f"- {b}" for b in story.acceptanceCriteria)
+
+        reporter_email = story.reporter_email or reporter_default
+        priority_name = story.priority or priority_default
+        merged_lb = _merged_labels(story.labels)
+        parent_key_raw = story.parent_issue_key if story.parent_issue_key is not None else parent_default
+
+        pts = story.story_points if story.story_points is not None else points_default_f
+
+        fields: dict[str, Any] = {
+            "project": {"key": proj},
+            "summary": story.summary,
+            "issuetype": {"name": issue_type},
+            "description": story.description or plain_ac[:400],
+            "priority": {"name": priority_name},
+            "labels": merged_lb,
+            "reporter": {"emailAddress": reporter_email},
+        }
+        payload: dict[str, Any] = {
+            "fields": fields,
+            "_demo_requestedStatus": story.requestedStatus,
+        }
+
+        parent_key_trim = (
+            parent_key_raw.strip() if isinstance(parent_key_raw, str) and parent_key_raw.strip() else None
+        )
+
+        if parent_key_trim:
+            fields["parent"] = {"key": parent_key_trim}
+            if feature_parent_cf:
+                fields[feature_parent_cf] = parent_key_trim
+
+        if prod_field:
+            fields[prod_field] = story.productLine
+        if ac_field:
+            fields[ac_field] = plain_ac
+
+        if sp_field and pts is not None:
+            fields[sp_field] = pts
+
+        posts.append(payload)
+
+    return posts
+
+
 class JiraConnector:
     def __init__(self, base_url: str, *, token: str | None = None, timeout: float = 45.0):
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -55,83 +139,8 @@ class JiraConnector:
         self._client.close()
 
     def create_stories(self, backlog: ApprovedBacklog, field_map: dict[str, Any]) -> list[dict[str, Any]]:
-        custom_fields_map = dict(field_map.get("customFields", {}))
-        defaults = dict(field_map.get("defaults") or {})
         results: list[dict[str, Any]] = []
-        proj = field_map["projectKey"]
-        issue_type = field_map["issueTypeName"]
-
-        ac_field = custom_fields_map.get("acceptanceCriteria") or ""
-        prod_field = custom_fields_map.get("productLine") or ""
-        sp_field = custom_fields_map.get("storyPoints") or ""
-        feature_parent_cf = (
-            custom_fields_map.get("featureParentKey") or custom_fields_map.get("epicLink") or ""
-        )
-
-        reporter_default = defaults.get("reporterEmail") or "janedoe@demo.com"
-        priority_default = defaults.get("priority") or "Medium"
-        labels_default = [str(l) for l in (defaults.get("labels") or []) if str(l)]
-        points_default_raw = defaults.get("storyPoints", 3)
-        try:
-            points_default_f: int | float = float(points_default_raw)
-            if points_default_f == int(points_default_f):
-                points_default_f = int(points_default_f)
-        except (TypeError, ValueError):
-            points_default_f = 3
-        parent_default = defaults.get("parentIssueKey")
-
-        def _merged_labels(extra: list[str] | None) -> list[str]:
-            seen: dict[str, None] = {}
-            merged: list[str] = []
-            for lab in [*labels_default, *(extra or [])]:
-                lowered = lab.strip()
-                if not lowered or lowered.casefold() in seen:
-                    continue
-                seen[lowered.casefold()] = None
-                merged.append(lab.strip())
-            return merged
-
-        for story in backlog.stories:
-            plain_ac = "\n".join(f"- {b}" for b in story.acceptanceCriteria)
-
-            reporter_email = story.reporter_email or reporter_default
-            priority_name = story.priority or priority_default
-            merged_lb = _merged_labels(story.labels)
-            parent_key_raw = story.parent_issue_key if story.parent_issue_key is not None else parent_default
-
-            pts = story.story_points if story.story_points is not None else points_default_f
-
-            fields: dict[str, Any] = {
-                "project": {"key": proj},
-                "summary": story.summary,
-                "issuetype": {"name": issue_type},
-                "description": story.description or plain_ac[:400],
-                "priority": {"name": priority_name},
-                "labels": merged_lb,
-                "reporter": {"emailAddress": reporter_email},
-            }
-            payload: dict[str, Any] = {
-                "fields": fields,
-                "_demo_requestedStatus": story.requestedStatus,
-            }
-
-            parent_key_trim = (
-                parent_key_raw.strip() if isinstance(parent_key_raw, str) and parent_key_raw.strip() else None
-            )
-
-            if parent_key_trim:
-                fields["parent"] = {"key": parent_key_trim}
-                if feature_parent_cf:
-                    fields[feature_parent_cf] = parent_key_trim
-
-            if prod_field:
-                fields[prod_field] = story.productLine
-            if ac_field:
-                fields[ac_field] = plain_ac
-
-            if sp_field and pts is not None:
-                fields[sp_field] = pts
-
+        for payload in build_jira_issue_posts(backlog, field_map):
             resp = self._client.post("/rest/api/3/issue", json=payload)
             resp.raise_for_status()
             results.append(resp.json())

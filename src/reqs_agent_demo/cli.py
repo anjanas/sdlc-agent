@@ -26,12 +26,12 @@ def _default_hub(ctx: typer.Context) -> None:
 
 @app.command("open-hub")
 def open_hub() -> None:
-    """Browse the mocked Confluence PRD hub (needs `uv run mock-dev`)."""
+    """Browse the mocked Confluence PRD hub (needs `uv run requirements-generation-agent`)."""
 
     base = os.environ.get("MOCK_BASE_URL", "http://127.0.0.1:8877").rstrip("/")
     url = f"{base}/"
     typer.echo(f"Opening mocked Confluence page: {url}")
-    typer.echo("Ensure `uv run mock-dev` runs in another shell.")
+    typer.echo("Ensure `uv run requirements-generation-agent` runs in another shell.")
     webbrowser.open(url)
 
 
